@@ -27,18 +27,26 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.tamurashingo.spring.oauth2.abstractcllient.OAuth2ClientService;
-import org.springframework.http.MediaType;
-import org.springframework.http.RequestEntity;
-import org.springframework.http.ResponseEntity;
+import org.springframework.http.*;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.util.DefaultUriBuilderFactory;
+import org.springframework.web.util.UriComponents;
+import org.springframework.web.util.UriComponentsBuilder;
+import org.springframework.web.util.UriUtils;
+import reactor.core.publisher.Mono;
 
+import java.io.UnsupportedEncodingException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Abstract implementation of the OAuth2ClientService interface that provides common functionality for
@@ -79,9 +87,24 @@ public abstract class AbstractOAuth2ClientServiceImpl implements OAuth2ClientSer
         tokenParams = initializeTokenParams();
     }
 
+    public String generateAuthenticationUri() {
+        MultiValueMap<String, String> params = generateParameters(authenticationParams, true);
+
+        return UriComponentsBuilder.fromUriString(getAuthorizationUri())
+                .queryParams(params)
+                .build()
+                .toUriString()
+                ;
+    }
+
     @Override
     public void addCallback(Callback callback) {
         this.callbacks.add(callback);
+    }
+
+    @Override
+    public void removeCallback(Callback callback) {
+        this.callbacks.remove(callback);
     }
 
     /**
@@ -150,16 +173,16 @@ public abstract class AbstractOAuth2ClientServiceImpl implements OAuth2ClientSer
 
     @Override
     public void fetchAccessToken(String code) throws OAuth2ClientServiceException {
-        ResponseEntity<String> response = exchangeWithCode(code);
-        Map<String, String> result = parseResponse(response.getBody());
+        String response = exchangeWithCode(code);
+        Map<String, String> result = parseResponse(response);
 
         callback(result);
     }
 
     @Override
     public void refreshAccessToken(String refreshToken) throws OAuth2ClientServiceException {
-        ResponseEntity<String> response = exchangeWithRefreshToken(refreshToken);
-        Map<String, String> result = parseResponse(response.getBody());
+        String response = exchangeWithRefreshToken(refreshToken);
+        Map<String, String> result = parseResponse(response);
 
         callback(result);
     }
@@ -168,38 +191,52 @@ public abstract class AbstractOAuth2ClientServiceImpl implements OAuth2ClientSer
      * Executes a token exchange using the given authorization code.
      *
      * @param code the authorization code.
-     * @return the response entity.
+     * @return the response.
      */
-    protected ResponseEntity<String> exchangeWithCode(String code) {
-        RestTemplate restTemplate = new RestTemplate();
+    protected String exchangeWithCode(String code) {
         MultiValueMap params = generateParameters(tokenParams);
         params.put("grant_type", "authorization_code");
         params.put("code", code);
-        RequestEntity request = RequestEntity.post(URI.create(getTokenUri()))
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .accept(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(params);
+        WebClient webClient = WebClient.builder()
+                .baseUrl(getTokenUri())
+                .defaultHeaders(this::addDefaultHeaders)
+                .build();
+        return webClient.post()
+                .bodyValue(params)
+                .retrieve()
+                .onStatus(HttpStatus::isError, clientResponse -> Mono.error(
+                        new OAuth2ClientServiceException("response error:" + clientResponse.rawStatusCode())))
+                .bodyToMono(String.class)
+                .block()
+                ;
+    }
 
-        return restTemplate.exchange(request, String.class);
+    protected void addDefaultHeaders(HttpHeaders headers) {
+        headers.add(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_FORM_URLENCODED_VALUE);
+        headers.add(HttpHeaders.ACCEPT, MediaType.APPLICATION_FORM_URLENCODED_VALUE);
     }
 
     /**
      * Executes a token exchange using the given refresh token
      *
      * @param refreshToken refresh_token.
-     * @return the response entity.
+     * @return the response.
      */
-    protected ResponseEntity<String> exchangeWithRefreshToken(String refreshToken) {
-        RestTemplate restTemplate = new RestTemplate();
+    protected String exchangeWithRefreshToken(String refreshToken) {
         MultiValueMap params = generateParameters(refreshTokenParams);
         params.put("grant_type", "refresh_token");
         params.put("refresh_token", refreshToken);
-        RequestEntity request = RequestEntity.post(URI.create(getTokenUri()))
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .accept(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(params);
-
-        return restTemplate.exchange(request, String.class);
+        WebClient webClient = WebClient.builder()
+                .baseUrl(getTokenUri())
+                .defaultHeaders(this::addDefaultHeaders)
+                .build();
+        return webClient.post()
+                .bodyValue(params)
+                .retrieve()
+                .onStatus(HttpStatus::isError, clientResponse -> Mono.error(
+                        new OAuth2ClientServiceException("response error:" + clientResponse.rawStatusCode())))
+                .bodyToMono(String.class)
+                .block();
     }
 
     /**
@@ -238,7 +275,16 @@ public abstract class AbstractOAuth2ClientServiceImpl implements OAuth2ClientSer
         return new LinkedMultiValueMap<String, String>(parameterMethods.entrySet().stream()
                 .filter(e -> e.getValue() != null)
                 .collect(Collectors.toMap(Map.Entry::getKey,
-                        e -> Arrays.asList(invokeGetter(e.getValue())))));
+                        e -> Arrays.asList(invokeGetter(e.getValue()), "UTF-8"))));
+    }
+
+    protected MultiValueMap<String, String> generateParameters(Map<String, Method> parameterMethods, boolean encode) throws OAuth2ClientServiceException {
+        final Function<String, String> encoder = encode ? s -> this.encode(s) : Function.identity();
+
+        return new LinkedMultiValueMap<String, String>(parameterMethods.entrySet().stream()
+                .filter(e -> e.getValue() != null)
+                .collect(Collectors.toMap(Map.Entry::getKey,
+                        e -> Arrays.asList(encoder.apply(invokeGetter(e.getValue()))))));
     }
 
     /**
@@ -251,6 +297,24 @@ public abstract class AbstractOAuth2ClientServiceImpl implements OAuth2ClientSer
         try {
             return (String)method.invoke(this);
         } catch (IllegalAccessException | InvocationTargetException ex) {
+            throw new RuntimeException(ex);
+        }
+    }
+
+    protected String encode(String str) throws RuntimeException {
+        try {
+            if (str == null) {
+                return null;
+            } else {
+                return URLEncoder.encode(str, "UTF-8")
+                        .replaceAll("\\+", "%20")
+                        .replaceAll("\\%21", "!")
+                        .replaceAll("\\%27", "'")
+                        .replaceAll("\\%28", "(")
+                        .replaceAll("\\%29", ")")
+                        .replaceAll("\\%7E", "~");
+            }
+        } catch (UnsupportedEncodingException ex) {
             throw new RuntimeException(ex);
         }
     }
